@@ -97,9 +97,9 @@ static void device_on_frame(sdp_ctx_t *ctx, const sdp_frame_t *f, void *user)
 static sdp_status_t device_build_announce(uint8_t *payload, uint8_t *len, void *user)
 {
     (void)user;
-    payload[0] = 1;
-    payload[1] = 0xC0; payload[2] = 0xFF; payload[3] = 0xEE;
-    *len = 4;
+    /* Application bytes (byte 3+ of ANNOUNCE; bytes 0-2 filled by transport) */
+    payload[0] = 0xC0; payload[1] = 0xFF; payload[2] = 0xEE;
+    *len = 3;
     return SDP_OK;
 }
 
@@ -118,8 +118,7 @@ static void host_on_frame(sdp_ctx_t *ctx, const sdp_frame_t *f, void *user)
 static sdp_status_t host_build_announce(uint8_t *payload, uint8_t *len, void *user)
 {
     (void)user;
-    payload[0] = 1;
-    *len = 1;
+    *len = 0;  /* no application bytes beyond the mandatory transport header */
     return SDP_OK;
 }
 
@@ -186,8 +185,13 @@ static void test_socket_handshake_and_ping_pong(void)
     CHECK_EQ((int)st, (int)SDP_OK);
 
     if (st == SDP_OK) {
-        CHECK_EQ((int)announce.payload[0], 1);  /* protocol version */
-        CHECK_EQ((int)announce.len, 4);
+        /* Mandatory transport bytes */
+        CHECK_EQ((int)announce.payload[0], (int)SDP_PROTOCOL_VERSION);
+        CHECK_EQ((int)announce.payload[1], (int)SDP_WINDOW);
+        CHECK_EQ((int)announce.payload[2], (int)SDP_MAX_PAYLOAD);
+        /* Application bytes (0xC0, 0xFF, 0xEE) start at byte 3 */
+        CHECK_EQ((int)announce.payload[3], 0xC0);
+        CHECK_EQ((int)announce.len, 6);  /* 3 transport + 3 app */
 
         /* Send PING_COUNT pings */
         for (i = 0; i < PING_COUNT; i++) {

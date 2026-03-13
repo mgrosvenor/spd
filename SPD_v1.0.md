@@ -1,6 +1,6 @@
 # Serial Datagram Protocol (SDP) — Specification
 
-*Revision 1.0 — 2026-03-13*
+*Revision 1.1 — 2026-03-13*
 
 ---
 
@@ -11,8 +11,9 @@
 3. [Startup Handshake](#3-startup-handshake)
 4. [Message Types](#4-message-types)
 5. [Sample Implementation](#5-sample-implementation)
-6. [Testing Specification](#6-testing-specification)
-7. [Revision History](#7-revision-history)
+6. [Performance Reference](#6-performance-reference)
+7. [Testing Specification](#7-testing-specification)
+8. [Revision History](#8-revision-history)
 
 ---
 
@@ -52,16 +53,16 @@ The SDP transport implementation (`sdp.c` / `sdp.h`) must have zero dependency o
 Framing follows HDLC (ISO 13239). Every frame is delimited by the flag byte 0x7E at both start and end. The 4-byte header packs SEQ and ACKSEQ into nibbles and TYPE and FLAGS into a single byte.
 
 ```
-┌────────┬──────────────────┬──────────────────┬────────┬───────────────┬─────────┬────────┐
-│  FLAG  │  SEQ[3:0]        │  TYPE[5:0]        │  LEN   │    PAYLOAD    │  CRC16  │  FLAG  │
-│  0x7E  │  ACKSEQ[3:0]     │  FLAGS[1:0]       │ 0–0x80 │  0–128 bytes  │  2 bytes│  0x7E  │
-└────────┴──────────────────┴──────────────────┴────────┴───────────────┴─────────┴────────┘
-   1 B           1 B                 1 B           1 B       N bytes       2 bytes    1 B
+┌────────┬──────────────────┬──────────────────┬────────┬────────────────────┬─────────┬────────┐
+│  FLAG  │  SEQ[3:0]        │  TYPE[5:0]        │  LEN   │      PAYLOAD       │  CRC16  │  FLAG  │
+│  0x7E  │  ACKSEQ[3:0]     │  FLAGS[1:0]       │ 0–0xFF │  0–SDP_MAX_PAYLOAD │  2 bytes│  0x7E  │
+└────────┴──────────────────┴──────────────────┴────────┴────────────────────┴─────────┴────────┘
+   1 B           1 B                 1 B           1 B           N bytes         2 bytes    1 B
 ```
 
 - **Minimum frame on wire:** 8 bytes (zero-length payload)
-- **Maximum frame on wire:** 135 bytes (128-byte payload + 7 overhead)
-- **Buffer slot (FLAG bytes stripped):** 132 bytes max
+- **Maximum frame on wire:** `SDP_MAX_PAYLOAD + 7` bytes (before escaping)
+- **Buffer slot (FLAG bytes stripped):** `SDP_SLOT_SIZE` = `SDP_MAX_PAYLOAD + 5` bytes
 
 ### 2.2 Field Definitions
 
@@ -70,7 +71,7 @@ Framing follows HDLC (ISO 13239). Every frame is delimited by the flag byte 0x7E
 | FLAG | 1 B | 0x7E | HDLC frame delimiter. Must be escaped if it appears in the frame body — see Section 2.3. |
 | SEQ / ACKSEQ | 1 B | nibbles 0x0–0xF | High nibble: sender SEQ (0–14, wraps 14→0; see Section 2.5). Low nibble: piggybacked ACK — SEQ of last valid frame received from the other side. 0xF = startup sentinel (no frame received yet). |
 | TYPE / FLAGS | 1 B | TYPE 0x00–0x3F | High 6 bits: message type (0–63). Low 2 bits: FLAGS. Bit 1 = RTX (this frame is a retransmit). Bit 0 = reserved, always transmit 0. |
-| LEN | 1 B | 0x00–0x80 | Payload length in bytes (0–128), measured after unescaping. Values 0x81–0xFF are reserved and must cause the frame to be rejected. |
+| LEN | 1 B | 0x00–0xFF | Payload length in bytes (0–`SDP_MAX_PAYLOAD`), measured after unescaping. Frames with LEN > `SDP_MAX_PAYLOAD` must be rejected. |
 | PAYLOAD | N B | 0x00–0xFF | Application data. Content defined by TYPE. May be empty (LEN=0). |
 | CRC16 | 2 B | 0x0000–0xFFFF | CRC-16/CCITT-FALSE over SEQ_ACKSEQ + TYPE_FLAGS + LEN + PAYLOAD (pre-escape values). Big-endian, high byte first. |
 
@@ -85,7 +86,7 @@ The flag byte 0x7E and escape byte 0x7D must not appear raw in the frame body (S
 
 CRC16 is computed on the original pre-escape bytes. Escaping is applied after CRC calculation on transmit and reversed before CRC verification on receipt.
 
-> **NOTE** Buffer slots are fixed at 132 bytes (header + max payload + CRC, FLAGS stripped). Frames with unescaped LEN > 0x80 must be rejected and the receiver returned to HUNT state.
+> **NOTE** Buffer slots are fixed at 260 bytes (3-byte header + 255-byte max payload + 2-byte CRC, FLAG bytes stripped).
 
 ### 2.4 CRC-16/CCITT-FALSE
 
@@ -110,7 +111,18 @@ uint16_t sdp_crc16(const uint8_t *data, uint8_t len) {
 
 ### 2.5 Sequence Numbers
 
-Each side maintains an independent 4-bit transmit sequence counter initialised to 0x0 at power-on and on every successful link establishment. The counter increments after each transmitted frame and wraps through values 0x0–0xE only — value 0xF is permanently reserved as the startup sentinel and is never used as a transmit SEQ.
+Each side maintains an independent 4-bit transmit sequence counter initialised to 0x0 at power-on and on every successful link establishment. The counter increments after each transmitted frame and wraps through values 0x0–`SDP_SEQ_MAX` only — value 0xF is permanently reserved as the startup sentinel and is never used as a transmit SEQ.
+
+`SDP_SEQ_MAX` and the usable sequence space size `SDP_SEQ_SIZE` are derived from `SDP_WINDOW` at compile time:
+
+```
+SDP_SEQ_SIZE = (15 / SDP_WINDOW) * SDP_WINDOW   /* integer division */
+SDP_SEQ_MAX  = SDP_SEQ_SIZE - 1
+```
+
+This yields the largest sequence space that is (a) an integer multiple of `SDP_WINDOW`, and (b) fits within the 15 usable SEQ values (0x0–0xE). For all valid window sizes (1–7) the result is at least 2× the window size, satisfying the duplicate-detection constraint. 0xF is never reached (maximum `SDP_SEQ_MAX` = 14 at `SDP_WINDOW` = 1, 3, or 5).
+
+Tying `SDP_SEQ_SIZE` to an exact multiple of `SDP_WINDOW` ensures the TX retransmit buffer (Section 2.9) is collision-free by construction: any `SDP_WINDOW` consecutive SEQ values, when indexed as `seq % SDP_WINDOW`, always map to distinct slots.
 
 SEQ occupies the high nibble of byte 1. ACKSEQ occupies the low nibble. ACKSEQ carries the SEQ of the last frame successfully received and CRC-validated from the other side. The startup sentinel value 0xF in ACKSEQ indicates no frame has been received yet.
 
@@ -130,17 +142,19 @@ Window size is controlled by the compile-time constant `SDP_WINDOW`, defaulting 
 #endif
 
 #if SDP_WINDOW < 1 || SDP_WINDOW > 7
-#  error "SDP_WINDOW must be in range 1–7 \
-(usable sequence space is 15; window must be <= floor(15/2))"
+#  error "SDP_WINDOW must be in range 1–7"
 #endif
+
+#define SDP_SEQ_SIZE ((15 / SDP_WINDOW) * SDP_WINDOW)
+#define SDP_SEQ_MAX  (SDP_SEQ_SIZE - 1)
 ```
 
-The constraint `SDP_WINDOW <= 7` is required for correct duplicate detection: the usable sequence space is 15 (values 0x0–0xE; 0xF reserved), and the window must not exceed half the sequence space, otherwise the receiver cannot distinguish a new frame from a retransmit when the window is fully in flight.
+The constraint `SDP_WINDOW <= 7` ensures `SDP_SEQ_SIZE >= 2 * SDP_WINDOW` for all valid window values, which is required for correct duplicate detection: the receiver must be able to distinguish a new frame from a retransmit when the window is fully in flight.
 
 The sender may have at most `SDP_WINDOW` unacknowledged frames in flight at any time. A frame is acknowledged when the receiver's outgoing ACKSEQ nibble equals or advances past that frame's SEQ value. If all slots are occupied the sender must wait before transmitting another frame.
 
 ```
-Each side:  SDP_WINDOW receive slots × 132 bytes = SDP_WINDOW × 132 bytes
+Each side:  SDP_WINDOW receive slots × SDP_SLOT_SIZE bytes = SDP_WINDOW × SDP_SLOT_SIZE bytes
 ```
 
 > **NOTE** Implementations may use receive buffers larger than `SDP_WINDOW` slots but must never send more than `SDP_WINDOW` unacknowledged frames to a peer that declares support for only `SDP_WINDOW` slots. The ANNOUNCE payload may be used by applications to advertise the window size if negotiation is needed; SDP itself does not negotiate this.
@@ -154,13 +168,23 @@ When a side receives a valid frame and has no application data to transmit withi
 ```
 HUNT        — discard bytes until 0x7E received
   ↓ 0x7E
-IN_FRAME    — accumulate bytes into 132-byte slot (FLAG bytes not stored)
+IN_FRAME    — accumulate bytes into SDP_SLOT_SIZE-byte slot (FLAG bytes not stored)
   ↓ 0x7D    → ESCAPED (next byte XOR 0x20, then back to IN_FRAME)
-  ↓ 0x7E    → end of frame: validate LEN ≤ 0x80, verify CRC16
+  ↓ 0x7E    → end of frame: validate LEN ≤ SDP_MAX_PAYLOAD, verify CRC16
                PASS → dispatch to message handler, update ACKSEQ nibble
                FAIL → discard frame, increment error counter, back to HUNT
   ↓ overflow → discard frame, back to HUNT
 ```
+
+### 2.9 TX Retransmit Buffer
+
+The sender maintains a statically-allocated TX ring of `SDP_WINDOW` slots. Each slot holds the type, flags, sequence number, length, and payload of one transmitted-but-unacknowledged frame.
+
+On transmit, the frame is stored in `tx_ring[seq % SDP_WINDOW]` before being put on wire. Because `SDP_SEQ_SIZE` is an exact multiple of `SDP_WINDOW` (Section 2.5), any `SDP_WINDOW` consecutive SEQ values map to distinct slots — no aliasing is possible.
+
+On receipt of a T_NAK (Section 4.5), the sender checks `tx_ring[bad_seq % SDP_WINDOW]`. If the stored slot's SEQ matches `bad_seq` the frame is retransmitted with the RTX flag set. A mismatch means the slot has already been recycled (the frame was acked before the NAK arrived) and no retransmit is performed.
+
+Slots are recycled naturally: a slot at index `i` can only be overwritten when the window advances far enough to reuse that index, which requires the peer to have acknowledged the frame previously stored there.
 
 ---
 
@@ -233,27 +257,31 @@ The TYPE field is 6 bits giving 64 possible values (0x00–0x3F).
 | 0x30 | Either | T_ACK |
 | 0x31 | Either | T_NAK |
 | 0x32 | Either | T_RESET |
-| 0x33–0x3B | — | Reserved for future transport extensions |
+| 0x33 | Host → Device | T_STATS_REQ — request link diagnostics |
+| 0x34 | Device → Host | T_STATS_RSP — link diagnostics response |
+| 0x35–0x3B | — | Reserved for future transport extensions |
 | 0x3C | Device → Host | UNSUPPORTED |
 | 0x3D–0x3F | — | Reserved |
 
-Applications built on SDP assign message types within the range 0x01–0x2F. They may also repurpose 0x33–0x3B for application-specific use provided no future SDP revision has claimed those values; applications should note any such usage clearly in their own specification.
+Applications built on SDP assign message types within the range 0x01–0x2F. They may also repurpose 0x35–0x3B for application-specific use provided no future SDP revision has claimed those values; applications should note any such usage clearly in their own specification.
 
 ### 4.2 ANNOUNCE — Handshake Acknowledgement
 
-**Type:** 0x00 | **Direction:** Device → Host | **Payload:** 1–128 bytes
+**Type:** 0x00 | **Direction:** Device → Host | **Payload:** 3–255 bytes
 
 Transmitted by the device as the handshake acknowledgement — the first frame sent after 16 consecutive 0xAA bytes are received. Sent once per link session without being requested.
 
-**Mandatory byte:**
+**Mandatory bytes:**
 
 | Byte | Field | Type | Description |
 |---|---|---|---|
-| 0 | protocol_version | uint8 | SDP protocol version implemented by this device. Current version: **1**. Must be the first byte. |
+| 0 | protocol_version | uint8 | SDP protocol version implemented by this device. Current version: **1**. |
+| 1 | window | uint8 | The device's `SDP_WINDOW` value (1–7). The host must not send more than this many unacknowledged frames. |
+| 2 | max_payload | uint8 | The device's `SDP_MAX_PAYLOAD` value (1–255). The host must not send frames with a payload exceeding this length. |
 
-**Bytes 1–127:** Application-defined. The application may use these bytes for any purpose — device identity, firmware version, capability flags, serial number, or any other data relevant to the link session. SDP places no constraints on their content or interpretation. The payload may be as short as 1 byte (protocol_version only) if the application has nothing further to announce.
+**Bytes 3–(SDP_MAX_PAYLOAD-1):** Application-defined. The application may use these bytes for any purpose — device identity, firmware version, capability flags, serial number, or any other data relevant to the link session. SDP places no constraints on their content or interpretation.
 
-The host must check `protocol_version` before issuing any commands. If the version is unsupported the host should close the session.
+The host must check `protocol_version`, `window`, and `max_payload` before issuing any commands. If the version is unsupported, or if the host cannot honour the device's window and payload constraints, the host should close the session.
 
 ### 4.3 UNSUPPORTED — Unrecognised Message Type
 
@@ -288,6 +316,32 @@ Sent on CRC validation failure. The sender may retransmit with the RTX flag set.
 **Type:** 0x32 | **Direction:** Either | **Payload:** none
 
 Resets sequence counters to 0x0 and flushes transmit buffers on both sides. The receiving side resets its own counters and responds with T_RESET to confirm. Use for mid-session recovery only — for power-on link establishment use the startup handshake (Section 3).
+
+### 4.7 T_STATS_REQ — Link Diagnostics Request
+
+**Type:** 0x33 | **Direction:** Host → Device | **Payload:** none
+
+Requests the device's current link diagnostic counters. The device responds with a T_STATS_RSP frame. The host may send T_STATS_REQ at any time during a linked session.
+
+### 4.8 T_STATS_RSP — Link Diagnostics Response
+
+**Type:** 0x34 | **Direction:** Device → Host | **Payload:** 36 bytes
+
+Sent by the device in response to T_STATS_REQ. Carries the device-side diagnostic counters so the host can observe both ends of the link in a single exchange.
+
+| Bytes | Field | Type | Description |
+|---|---|---|---|
+| 0–3 | rx_frames | uint32 le | Frames received and CRC-validated |
+| 4–7 | tx_frames | uint32 le | Frames transmitted (including retransmits) |
+| 8–11 | crc_errors | uint32 le | Frames rejected due to CRC failure |
+| 12–15 | rx_overflows | uint32 le | Frames dropped due to RX buffer overflow |
+| 16–19 | drop_count | uint32 le | SEQ gaps detected (lost frames) |
+| 20–23 | nak_sent | uint32 le | T_NAK frames sent |
+| 24–27 | nak_received | uint32 le | T_NAK frames received |
+| 28–31 | window_full | uint32 le | Send attempts rejected due to window full |
+| 32–35 | hal_errors | uint32 le | HAL write errors |
+
+All fields are 32-bit unsigned little-endian integers. The counters are cumulative since the last `sdp_init` or `sdp_reset`. The host may diff successive responses to compute rates.
 
 ---
 
@@ -329,9 +383,24 @@ uint32_t sdp_hal_millis(void);
 #endif
 
 #if SDP_WINDOW < 1 || SDP_WINDOW > 7
-#  error "SDP_WINDOW must be in range 1–7 \
-(usable sequence space is 15; window must be <= floor(15/2))"
+#  error "SDP_WINDOW must be in range 1–7"
 #endif
+
+/* Sequence space: largest multiple of SDP_WINDOW fitting in 0x0–0xE.   */
+#define SDP_SEQ_SIZE ((15 / SDP_WINDOW) * SDP_WINDOW)
+#define SDP_SEQ_MAX  (SDP_SEQ_SIZE - 1)
+
+/* Maximum payload bytes per frame. Default 255. Must be 1–255.         */
+#ifndef SDP_MAX_PAYLOAD
+#  define SDP_MAX_PAYLOAD 255
+#endif
+
+#if SDP_MAX_PAYLOAD < 1 || SDP_MAX_PAYLOAD > 255
+#  error "SDP_MAX_PAYLOAD must be in range 1–255"
+#endif
+
+/* Buffer slot size: header(3) + payload + crc(2), FLAG bytes stripped. */
+#define SDP_SLOT_SIZE (SDP_MAX_PAYLOAD + 5)
 
 #endif /* SDP_CONFIG_H */
 ```
@@ -654,7 +723,59 @@ uint32_t sdp_hal_millis(void) { return HAL_GetTick(); }
 
 ---
 
-## 6. Testing Specification
+## 6. Performance Reference
+
+### 6.1 Frame Overhead and Efficiency
+
+Every SDP frame carries 7 bytes of overhead (2 FLAGS + 3 header + 2 CRC) before byte stuffing. Efficiency at a given payload size (before stuffing) is:
+
+```
+efficiency = payload / (payload + 7)
+```
+
+| Payload (bytes) | Efficiency | Typical use |
+|---|---|---|
+| 1 | 12.5% | Single status byte |
+| 8 | 53% | Short command |
+| 32 | 82% | Small data packet |
+| 128 | 95% | Medium block |
+| 255 | 97% | Maximum (default) |
+
+Byte stuffing adds at most one extra byte per stuffed byte. In the worst case (all payload bytes are 0x7E or 0x7D) frame size doubles. In practice, stuffing overhead is negligible for arbitrary binary data.
+
+### 6.2 Latency at Common Serial Rates
+
+One-way frame latency = time to transmit the frame at the line rate. The table below uses the maximum (worst-case) frame size at each `SDP_MAX_PAYLOAD` setting, assuming no byte stuffing, one start bit, eight data bits, one stop bit (10 bits/byte).
+
+| Baud rate | 255 B payload (262 B frame) | 128 B payload (135 B frame) | 32 B payload (39 B frame) |
+|---|---|---|---|
+| 9 600 | 274 ms | 141 ms | 41 ms |
+| 115 200 | 22.8 ms | 11.7 ms | 3.4 ms |
+| 460 800 | 5.7 ms | 2.9 ms | 0.8 ms |
+| 1 000 000 | 2.6 ms | 1.35 ms | 0.39 ms |
+| 3 000 000 | 0.87 ms | 0.45 ms | 0.13 ms |
+
+Round-trip latency (command + response, minimum two frames in flight) is approximately 2× the one-way values. The 50 ms T_ACK timer (Section 2.7) adds up to 50 ms to the effective round trip if no piggybacked ACK is available, so applications should aim to reply within the ACK window.
+
+### 6.3 Throughput at Common Serial Rates
+
+Maximum sustained throughput uses the sliding window to keep the link full. With `SDP_WINDOW` frames in flight and frame period T:
+
+```
+throughput ≈ (SDP_WINDOW × payload) / T_round_trip
+```
+
+For a 115 200 baud link, 255 B payload, SDP_WINDOW = 2, round-trip ≈ 46 ms (two max frames):
+
+```
+throughput ≈ (2 × 255) / 0.046 ≈ 11 kB/s  (≈ 88 kbit/s payload, ~76% of line rate)
+```
+
+Increasing `SDP_MAX_PAYLOAD` to 255 and `SDP_WINDOW` to 7 at 115 200 baud approaches the practical line-rate ceiling for bulk transfers. At 1 Mbit/s and above the window is typically large enough that throughput is limited by the application processing rate rather than the protocol overhead.
+
+---
+
+## 7. Testing Specification
 
 These tests verify the SDP transport layer in isolation. An application protocol built on SDP should add its own test suite for application message types.
 
@@ -765,4 +886,5 @@ Attempt to compile with SDP_WINDOW=8. Confirm a compile-time error is emitted. C
 
 | Revision | Date | Changes |
 |---|---|---|
-| 1.0 | 2026-03-13 | Initial release as standalone library specification, extracted from SmartDimmer Protocol Specification v1.4. Transport layer, startup handshake, ANNOUNCE (protocol_version mandatory; remaining bytes application-defined), UNSUPPORTED (0x3C), T_ACK/T_NAK/T_RESET. Maximum payload 128 bytes (LEN 0x00–0x80). SDP_WINDOW compile-time constant defaulting to 2, static assert 1–7. HAL renamed sdp_hal_write/read/millis. All application message types, bootloader protocol, and platform-specific content removed. Platform HAL examples: x86/libserialport, AVR, ARM Cortex-M. |
+| 1.1 | 2026-03-13 | TX retransmit buffer: sender stores each transmitted frame in `tx_ring[seq % SDP_WINDOW]`; T_NAK triggers retransmit from ring with RTX flag (Section 2.9). SDP_SEQ_SIZE/SDP_SEQ_MAX derived from SDP_WINDOW as `(15/SDP_WINDOW)*SDP_WINDOW`, guaranteed ≥ 2× window (Section 2.5). SDP_MAX_PAYLOAD promoted to compile-time parameter (default 255, range 3–255); SDP_SLOT_SIZE derived as SDP_MAX_PAYLOAD+5. ANNOUNCE bytes 1–2 now mandatory transport fields (window, max_payload). T_STATS_REQ (0x33) / T_STATS_RSP (0x34) added for host-side link diagnostics (Section 4.7–4.8). Performance reference section added (Section 6). |
+| 1.0 | 2026-03-13 | Initial release as standalone library specification. Transport layer, startup handshake, ANNOUNCE (protocol_version mandatory; remaining bytes application-defined), UNSUPPORTED (0x3C), T_ACK/T_NAK/T_RESET. Maximum payload 128 bytes (LEN 0x00–0x80). SDP_WINDOW compile-time constant defaulting to 2, static assert 1–7. Platform HAL examples: x86/libserialport, AVR, ARM Cortex-M. |
