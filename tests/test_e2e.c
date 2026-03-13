@@ -562,6 +562,103 @@ static void test_e2e_stats(void)
     CHECK_EQ((int)remote.crc_errors, 0);
 }
 
+/* ── TEST-E2E-11: 1-byte payload boundary ───────────────────────────────── */
+/*
+ * Verifies that a single-byte payload survives framing, CRC, and delivery.
+ * Guards against off-by-one bugs in the header/payload/CRC byte counts.
+ */
+static void test_e2e_payload_1byte(void)
+{
+    endpoint_t host, device;
+    sdp_status_t st;
+    uint8_t single = 0xA5;
+
+    pipe_init(&pipe_a_to_b);
+    pipe_init(&pipe_b_to_a);
+    g_fake_millis = 0;
+
+    ep_init(&host,   &pipe_a_to_b, &pipe_b_to_a);
+    ep_init(&device, &pipe_b_to_a, &pipe_a_to_b);
+
+    sdp_listen(&device.ctx);
+    {
+        uint8_t sync[SDP_SYNC_SEND];
+        memset(sync, 0xAA, SDP_SYNC_SEND);
+        host.hal.write(sync, SDP_SYNC_SEND, host.hal.user);
+    }
+    pump(&host, &device);
+    pump(&host, &device);
+
+    host.ctx.state  = SDP_STATE_LINKED;
+    host.ctx.tx_seq = 0;
+
+    st = sdp_send(&host.ctx, 0x01, 0, &single, 1);
+    CHECK_EQ((int)st, (int)SDP_OK);
+
+    pump(&host, &device);
+
+    CHECK_EQ(device.frame_count, 1);
+    CHECK_EQ((int)device.last_frame.len, 1);
+    CHECK_EQ((int)device.last_frame.payload[0], (int)single);
+    /* No CRC errors expected */
+    sdp_diag_t d;
+    sdp_get_diag(&device.ctx, &d);
+    CHECK_EQ((int)d.crc_errors, 0);
+}
+
+/* ── TEST-E2E-12: 255-byte payload boundary ─────────────────────────────── */
+/*
+ * Exercises the maximum payload size (SDP_MAX_PAYLOAD = 255 by default).
+ * This also validates the CRC correctness bug-fix: crc16_feed previously
+ * took a uint8_t length, truncating values > 255 to wrong byte counts for
+ * payloads of 253-255 bytes.  The test fills the payload with a known
+ * pattern and verifies every byte arrives intact.
+ */
+static void test_e2e_payload_255byte(void)
+{
+    endpoint_t host, device;
+    sdp_status_t st;
+    uint8_t big[SDP_MAX_PAYLOAD];
+    int i;
+
+    for (i = 0; i < SDP_MAX_PAYLOAD; i++)
+        big[i] = (uint8_t)(i & 0xFFu);
+
+    pipe_init(&pipe_a_to_b);
+    pipe_init(&pipe_b_to_a);
+    g_fake_millis = 0;
+
+    ep_init(&host,   &pipe_a_to_b, &pipe_b_to_a);
+    ep_init(&device, &pipe_b_to_a, &pipe_a_to_b);
+
+    sdp_listen(&device.ctx);
+    {
+        uint8_t sync[SDP_SYNC_SEND];
+        memset(sync, 0xAA, SDP_SYNC_SEND);
+        host.hal.write(sync, SDP_SYNC_SEND, host.hal.user);
+    }
+    pump(&host, &device);
+    pump(&host, &device);
+
+    host.ctx.state  = SDP_STATE_LINKED;
+    host.ctx.tx_seq = 0;
+
+    st = sdp_send(&host.ctx, 0x01, 0, big, SDP_MAX_PAYLOAD);
+    CHECK_EQ((int)st, (int)SDP_OK);
+
+    pump(&host, &device);
+
+    CHECK_EQ(device.frame_count, 1);
+    CHECK_EQ((int)device.last_frame.len, (int)SDP_MAX_PAYLOAD);
+    for (i = 0; i < SDP_MAX_PAYLOAD; i++)
+        CHECK_EQ((int)device.last_frame.payload[i], (int)big[i]);
+
+    /* No CRC errors — this is the primary assertion for the CRC-length fix */
+    sdp_diag_t d;
+    sdp_get_diag(&device.ctx, &d);
+    CHECK_EQ((int)d.crc_errors, 0);
+}
+
 int main(void)
 {
     test_e2e_handshake_and_data();
@@ -574,5 +671,7 @@ int main(void)
     test_e2e_seq_wraparound();
     test_e2e_multi_loss();
     test_e2e_stats();
+    test_e2e_payload_1byte();
+    test_e2e_payload_255byte();
     TEST_SUMMARY();
 }

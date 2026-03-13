@@ -15,9 +15,11 @@ static const uint16_t crc16_tbl[16] = {
     0xC18Cu, 0xD1ADu, 0xE1CEu, 0xF1EFu
 };
 
-static uint16_t crc16_feed(uint16_t crc, const uint8_t *data, uint8_t len)
+/* len uses sdp_rx_pos_t (uint8_t or uint16_t) so it can hold values up to
+ * SDP_MAX_PAYLOAD+3 (up to 258 for the default SDP_MAX_PAYLOAD=255). */
+static uint16_t crc16_feed(uint16_t crc, const uint8_t *data, sdp_rx_pos_t len)
 {
-    uint8_t i;
+    sdp_rx_pos_t i;
     for (i = 0; i < len; i++) {
         crc = (uint16_t)((crc << 4) ^ crc16_tbl[(crc >> 12) ^ (data[i] >> 4)]);
         crc = (uint16_t)((crc << 4) ^ crc16_tbl[(crc >> 12) ^ (data[i] & 0x0Fu)]);
@@ -27,6 +29,9 @@ static uint16_t crc16_feed(uint16_t crc, const uint8_t *data, uint8_t len)
 
 #define crc16(data, len)             crc16_feed(0xFFFFu, (data), (len))
 #define crc16_extend(crc, data, len) crc16_feed((crc),   (data), (len))
+
+/* Forward declaration — defined in the Receiving section below. */
+static inline void rx_byte_inner(sdp_ctx_t *ctx, uint8_t byte);
 
 /*
  * Number of unacknowledged frames in flight.
@@ -43,8 +48,9 @@ static uint8_t seq_unacked(uint8_t tx_seq, uint8_t peer_ackseq)
     return n;
 }
 
-/* Write one byte with HDLC escaping. Returns 0 on success, -1 on HAL error. */
-static int write_escaped(const sdp_ctx_t *ctx, uint8_t b)
+/* Write one byte with HDLC escaping. Returns 0 on success, -1 on HAL error.
+ * Inlined into transmit_frame to eliminate per-byte function call overhead. */
+static inline int write_escaped(const sdp_ctx_t *ctx, uint8_t b)
 {
     if (b == SDP_FLAG_BYTE || b == SDP_ESC_BYTE) {
         uint8_t esc[2];
@@ -126,6 +132,7 @@ static void process_frame(sdp_ctx_t *ctx)
 {
     uint8_t   len_field, seq, ackseq, type, flags;
     uint16_t  expected, actual;
+    uint32_t  now;
 
     if (ctx->rx_pos < 5) return;
 
@@ -141,7 +148,8 @@ static void process_frame(sdp_ctx_t *ctx)
 
     expected = ((uint16_t)ctx->rx_buf[ctx->rx_pos - 2] << 8)
              | ctx->rx_buf[ctx->rx_pos - 1];
-    actual   = crc16(ctx->rx_buf, (uint8_t)(ctx->rx_pos - 2u));
+    /* rx_pos - 2 can exceed 255 for large payloads; do not cast to uint8_t */
+    actual   = crc16(ctx->rx_buf, ctx->rx_pos - 2u);
 
     if (actual != expected) {
         ctx->diag.crc_errors++;
@@ -154,10 +162,13 @@ static void process_frame(sdp_ctx_t *ctx)
     type   = ctx->rx_buf[1] >> 2;
     flags  = ctx->rx_buf[1] & 0x03u;
 
+    /* Capture millis() once; reused below to avoid a second HAL call. */
+    now = ctx->hal->millis(ctx->hal->user);
+
     ctx->peer_ackseq = ackseq;
     ctx->rx_ackseq   = seq;
     ctx->ack_pending = 1;
-    ctx->last_rx_ms  = ctx->hal->millis(ctx->hal->user);
+    ctx->last_rx_ms  = now;
     ctx->diag.rx_frames++;
 
     ctx->rx_frame.type   = type;
@@ -176,7 +187,7 @@ static void process_frame(sdp_ctx_t *ctx)
 
     switch (type) {
     case SDP_T_ACK:
-        ctx->last_ack_ms = ctx->hal->millis(ctx->hal->user);
+        ctx->last_ack_ms = now;
         ctx->ack_pending = 0;
         return;
 
@@ -209,24 +220,25 @@ static void process_frame(sdp_ctx_t *ctx)
 
     case SDP_T_STATS_REQ: {
         /* Pack local diagnostics into a T_STATS_RSP payload (little-endian).
-         * Written directly into rx_frame.payload to avoid a second stack buffer. */
-        uint8_t *rsp = ctx->rx_frame.payload;
-        const uint32_t counts[9] = {
-            ctx->diag.rx_frames,    ctx->diag.tx_frames,
-            ctx->diag.crc_errors,   ctx->diag.rx_overflows,
-            ctx->diag.drop_count,   ctx->diag.nak_sent,
-            ctx->diag.nak_received, ctx->diag.window_full,
-            ctx->diag.hal_errors
-        };
-        uint8_t i;
-        for (i = 0; i < 9; i++) {
-            rsp[i*4+0] = (uint8_t)(counts[i]        & 0xFFu);
-            rsp[i*4+1] = (uint8_t)((counts[i] >>  8) & 0xFFu);
-            rsp[i*4+2] = (uint8_t)((counts[i] >> 16) & 0xFFu);
-            rsp[i*4+3] = (uint8_t)((counts[i] >> 24) & 0xFFu);
-        }
+         * WR32 writes each uint32_t field via pointer increment — no intermediate
+         * 36-byte stack array, no i*4 multiply in the inner loop. */
+        uint8_t *p = ctx->rx_frame.payload;
+        #define WR32(v) do { uint32_t _v = (v); \
+            *p++ = (uint8_t)(_v);         *p++ = (uint8_t)((_v) >>  8); \
+            *p++ = (uint8_t)((_v) >> 16); *p++ = (uint8_t)((_v) >> 24); \
+        } while(0)
+        WR32(ctx->diag.rx_frames);
+        WR32(ctx->diag.tx_frames);
+        WR32(ctx->diag.crc_errors);
+        WR32(ctx->diag.rx_overflows);
+        WR32(ctx->diag.drop_count);
+        WR32(ctx->diag.nak_sent);
+        WR32(ctx->diag.nak_received);
+        WR32(ctx->diag.window_full);
+        WR32(ctx->diag.hal_errors);
+        #undef WR32
         transmit_frame(ctx, SDP_T_STATS_RSP, 0,
-                       ctx->tx_seq, ctx->rx_ackseq, rsp, 36);
+                       ctx->tx_seq, ctx->rx_ackseq, ctx->rx_frame.payload, 36);
         return;
     }
 
@@ -298,23 +310,26 @@ sdp_status_t sdp_get_diag(const sdp_ctx_t *ctx, sdp_diag_t *out)
  */
 sdp_status_t sdp_send_announce(sdp_ctx_t *ctx)
 {
-    uint8_t      payload[SDP_MAX_PAYLOAD];
     uint8_t      app_len = 0;
     sdp_status_t st;
 
     if (!ctx) return SDP_ERR_BAD_ARG;
 
-    payload[0] = SDP_PROTOCOL_VERSION;
-    payload[1] = SDP_WINDOW;
-    payload[2] = SDP_MAX_PAYLOAD;
+    /* Build the announce payload directly into ctx->rx_frame.payload.
+     * This is safe: the bytes are transmitted immediately and the buffer
+     * is only used for reception, which cannot interleave on a single thread.
+     * Eliminates a uint8_t payload[SDP_MAX_PAYLOAD] stack allocation (≤255 B). */
+    ctx->rx_frame.payload[0] = SDP_PROTOCOL_VERSION;
+    ctx->rx_frame.payload[1] = SDP_WINDOW;
+    ctx->rx_frame.payload[2] = SDP_MAX_PAYLOAD;
 
-    st = ctx->on_build_announce(payload + 3, &app_len, ctx->user);
+    st = ctx->on_build_announce(ctx->rx_frame.payload + 3, &app_len, ctx->user);
     if (st != SDP_OK) return st;
 
     if ((uint16_t)app_len + 3u > SDP_MAX_PAYLOAD) return SDP_ERR_PAYLOAD_TOO_LARGE;
 
     return transmit_frame(ctx, SDP_T_ANNOUNCE, 0, 0, SDP_SEQ_NONE,
-                          payload, (uint8_t)(app_len + 3u));
+                          ctx->rx_frame.payload, (uint8_t)(app_len + 3u));
 }
 
 sdp_status_t sdp_listen(sdp_ctx_t *ctx)
@@ -392,7 +407,7 @@ sdp_status_t sdp_connect(sdp_ctx_t *ctx, uint32_t timeout_ms, sdp_frame_t *out_a
 
         b = ctx->hal->read(ctx->hal->user);
         if (b >= 0)
-            sdp_rx_byte(ctx, (uint8_t)b);
+            rx_byte_inner(ctx, (uint8_t)b);
 
         if (cc.got_announce) {
             ctx->on_frame = cc.original_on_frame;
@@ -450,10 +465,14 @@ sdp_status_t sdp_send(sdp_ctx_t *ctx, uint8_t type, uint8_t flags,
 
 /* ── Receiving ──────────────────────────────────────────────────────────── */
 
-sdp_status_t sdp_rx_byte(sdp_ctx_t *ctx, uint8_t byte)
+/*
+ * Inner receive byte function — no null check, void return.
+ * Declared static inline so sdp_poll's tight loop has zero call overhead;
+ * the compiler inlines the body directly into the while loop.
+ * sdp_rx_byte (public API) is a thin checked wrapper around this.
+ */
+static inline void rx_byte_inner(sdp_ctx_t *ctx, uint8_t byte)
 {
-    if (!ctx) return SDP_ERR_BAD_ARG;
-
     if (ctx->sync_hunt_enabled) {
         if (ctx->state == SDP_STATE_SYNC_HUNT) {
             if (byte == SDP_SYNC_BYTE) {
@@ -464,13 +483,16 @@ sdp_status_t sdp_rx_byte(sdp_ctx_t *ctx, uint8_t byte)
                     ctx->holdoff_start = ctx->hal->millis(ctx->hal->user);
                     ctx->sync_count    = 0;
                 }
-                return SDP_OK;
+                return;
             } else if (byte != SDP_FLAG_BYTE) {
                 ctx->sync_count = 0;
-                return SDP_OK;
+                return;
             }
         } else if (ctx->state == SDP_STATE_SYNC_ACK) {
-            if (byte == SDP_SYNC_BYTE) return SDP_OK;
+            /* Discard host sync retop-ups that arrive before the first frame.
+             * Once inside a frame (rx_in_frame=1), 0xAA is legitimate payload
+             * data and must not be dropped. */
+            if (byte == SDP_SYNC_BYTE && !ctx->rx_in_frame) return;
         }
     }
 
@@ -480,14 +502,14 @@ sdp_status_t sdp_rx_byte(sdp_ctx_t *ctx, uint8_t byte)
         ctx->rx_in_frame = 1;
         ctx->rx_pos      = 0;
         ctx->rx_escaped  = 0;
-        return SDP_OK;
+        return;
     }
 
-    if (!ctx->rx_in_frame) return SDP_OK;
+    if (!ctx->rx_in_frame) return;
 
     if (byte == SDP_ESC_BYTE) {
         ctx->rx_escaped = 1;
-        return SDP_OK;
+        return;
     }
     if (ctx->rx_escaped) {
         byte = (uint8_t)(byte ^ 0x20u);
@@ -501,6 +523,13 @@ sdp_status_t sdp_rx_byte(sdp_ctx_t *ctx, uint8_t byte)
         ctx->rx_in_frame = 0;
         ctx->rx_pos      = 0;
     }
+}
+
+/* Public entry point: validates ctx, then delegates to the inline inner. */
+sdp_status_t sdp_rx_byte(sdp_ctx_t *ctx, uint8_t byte)
+{
+    if (!ctx) return SDP_ERR_BAD_ARG;
+    rx_byte_inner(ctx, byte);
     return SDP_OK;
 }
 
@@ -508,8 +537,10 @@ sdp_status_t sdp_poll(sdp_ctx_t *ctx)
 {
     int b;
     if (!ctx || !ctx->hal->read) return SDP_ERR_BAD_ARG;
+    /* Use rx_byte_inner directly: ctx is validated above, and the inline
+     * eliminates per-byte CALL/RET overhead and the null check. */
     while ((b = ctx->hal->read(ctx->hal->user)) >= 0)
-        sdp_rx_byte(ctx, (uint8_t)b);
+        rx_byte_inner(ctx, (uint8_t)b);
     return SDP_OK;
 }
 
