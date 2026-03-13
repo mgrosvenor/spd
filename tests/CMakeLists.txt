@@ -54,8 +54,12 @@ macro(add_cross_compile_test NAME COMPILER CFLAGS)
 endmacro()
 
 add_cross_compile_test(arm-none-eabi-cm4    arm-none-eabi-gcc       "-mcpu=cortex-m4 -mthumb")
-add_cross_compile_test(aarch64-apple-m4     cc                      "-arch arm64 -mcpu=apple-m4")
 add_cross_compile_test(avr-attiny1616        avr-gcc                 "-mmcu=attiny1616 -Os")
 add_cross_compile_test(pic-xc8              xc8-cc                  "-mcpu=18F4520")
 add_cross_compile_test(xtensa-esp32-u4wdh   xtensa-esp32-elf-gcc    "-mlongcalls -mtext-section-literals")
 add_cross_compile_test(x86_64-linux-musl    x86_64-linux-musl-gcc   "")
+
+# Apple-specific: native cc with -arch arm64 only makes sense on macOS
+if(APPLE)
+    add_cross_compile_test(aarch64-apple-m4 cc "-arch arm64 -mcpu=apple-m4")
+endif()
