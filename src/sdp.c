@@ -3,40 +3,44 @@
 
 /* ── Internal helpers ───────────────────────────────────────────────────── */
 
-static uint16_t crc16_extend(uint16_t crc, const uint8_t *data, uint8_t len);
+/*
+ * CRC-16/CCITT-FALSE (poly=0x1021, init=0xFFFF) using a 16-entry nibble
+ * table. Two table lookups per byte; 32 bytes of ROM. On 8-bit MCUs this
+ * is significantly cheaper than the 8-iteration bit-by-bit alternative.
+ */
+static const uint16_t crc16_tbl[16] = {
+    0x0000u, 0x1021u, 0x2042u, 0x3063u,
+    0x4084u, 0x50A5u, 0x60C6u, 0x70E7u,
+    0x8108u, 0x9129u, 0xA14Au, 0xB16Bu,
+    0xC18Cu, 0xD1ADu, 0xE1CEu, 0xF1EFu
+};
+
+static uint16_t crc16_feed(uint16_t crc, const uint8_t *data, uint8_t len)
+{
+    uint8_t i;
+    for (i = 0; i < len; i++) {
+        crc = (uint16_t)((crc << 4) ^ crc16_tbl[(crc >> 12) ^ (data[i] >> 4)]);
+        crc = (uint16_t)((crc << 4) ^ crc16_tbl[(crc >> 12) ^ (data[i] & 0x0Fu)]);
+    }
+    return crc;
+}
+
+#define crc16(data, len)             crc16_feed(0xFFFFu, (data), (len))
+#define crc16_extend(crc, data, len) crc16_feed((crc),   (data), (len))
 
 /*
  * Number of unacknowledged frames in flight.
  * tx_seq = next SEQ to use; peer_ackseq = last ACKSEQ received from peer.
+ * Uses a conditional subtract instead of modulo — no division on 8-bit MCU.
  */
 static uint8_t seq_unacked(uint8_t tx_seq, uint8_t peer_ackseq)
 {
+    uint8_t n;
     if (peer_ackseq == SDP_SEQ_NONE)
         return tx_seq;
-    return (uint8_t)((tx_seq + SDP_SEQ_SIZE - peer_ackseq - 1u) % SDP_SEQ_SIZE);
-}
-
-static uint16_t crc16(const uint8_t *data, uint8_t len)
-{
-    uint16_t crc = 0xFFFF;
-    uint8_t i, j;
-    for (i = 0; i < len; i++) {
-        crc ^= (uint16_t)data[i] << 8;
-        for (j = 0; j < 8; j++)
-            crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u) : (uint16_t)(crc << 1);
-    }
-    return crc;
-}
-
-static uint16_t crc16_extend(uint16_t crc, const uint8_t *data, uint8_t len)
-{
-    uint8_t i, j;
-    for (i = 0; i < len; i++) {
-        crc ^= (uint16_t)data[i] << 8;
-        for (j = 0; j < 8; j++)
-            crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u) : (uint16_t)(crc << 1);
-    }
-    return crc;
+    n = (uint8_t)(tx_seq + SDP_SEQ_SIZE - peer_ackseq - 1u);
+    if (n >= SDP_SEQ_SIZE) n = (uint8_t)(n - SDP_SEQ_SIZE);
+    return n;
 }
 
 /* Write one byte with HDLC escaping. Returns 0 on success, -1 on HAL error. */
@@ -116,12 +120,12 @@ static sdp_status_t send_nak(sdp_ctx_t *ctx, uint8_t bad_seq_ack)
     return st;
 }
 
-/* Process a fully assembled, unescaped frame in rx_buf[0..rx_pos-1]. */
+/* Process a fully assembled, unescaped frame in rx_buf[0..rx_pos-1].
+ * Decoded frame is written into ctx->rx_frame (no large stack local). */
 static void process_frame(sdp_ctx_t *ctx)
 {
-    uint8_t      len_field, seq, ackseq, type, flags;
-    uint16_t     expected, actual;
-    sdp_frame_t  frame;
+    uint8_t   len_field, seq, ackseq, type, flags;
+    uint16_t  expected, actual;
 
     if (ctx->rx_pos < 5) return;
 
@@ -130,7 +134,7 @@ static void process_frame(sdp_ctx_t *ctx)
         ctx->diag.crc_errors++;
         return;
     }
-    if (ctx->rx_pos != (uint16_t)(len_field + 5u)) {
+    if (ctx->rx_pos != (sdp_rx_pos_t)(len_field + 5u)) {
         ctx->diag.crc_errors++;
         return;
     }
@@ -156,13 +160,13 @@ static void process_frame(sdp_ctx_t *ctx)
     ctx->last_rx_ms  = ctx->hal->millis(ctx->hal->user);
     ctx->diag.rx_frames++;
 
-    frame.type   = type;
-    frame.flags  = flags;
-    frame.seq    = seq;
-    frame.ackseq = ackseq;
-    frame.len    = len_field;
+    ctx->rx_frame.type   = type;
+    ctx->rx_frame.flags  = flags;
+    ctx->rx_frame.seq    = seq;
+    ctx->rx_frame.ackseq = ackseq;
+    ctx->rx_frame.len    = len_field;
     if (len_field > 0)
-        memcpy(frame.payload, ctx->rx_buf + 3, len_field);
+        memcpy(ctx->rx_frame.payload, ctx->rx_buf + 3, len_field);
 
     if (ctx->state == SDP_STATE_SYNC_ACK) {
         ctx->state       = SDP_STATE_LINKED;
@@ -183,34 +187,41 @@ static void process_frame(sdp_ctx_t *ctx)
         transmit_frame(ctx, SDP_T_RESET, 0, 0, SDP_SEQ_NONE, NULL, 0);
         return;
 
-    case SDP_T_NAK:
+    case SDP_T_NAK: {
+        /* Linear scan avoids modulo; at most SDP_WINDOW (1-7) iterations. */
+        uint8_t bad_seq, i;
         ctx->diag.nak_received++;
-        if (frame.len >= 1) {
-            uint8_t bad_seq = frame.payload[0] >> 4;
-            sdp_tx_slot_t *slot = &ctx->tx_ring[bad_seq % SDP_WINDOW];
-            if (slot->seq == bad_seq)
-                transmit_frame(ctx, slot->type,
-                               (uint8_t)(slot->flags | SDP_FLAG_RTX),
-                               slot->seq, ctx->rx_ackseq,
-                               slot->payload, slot->len);
+        if (ctx->rx_frame.len >= 1) {
+            bad_seq = ctx->rx_frame.payload[0] >> 4;
+            for (i = 0; i < SDP_WINDOW; i++) {
+                if (ctx->tx_ring[i].seq == bad_seq) {
+                    transmit_frame(ctx, ctx->tx_ring[i].type,
+                                   (uint8_t)(ctx->tx_ring[i].flags | SDP_FLAG_RTX),
+                                   ctx->tx_ring[i].seq, ctx->rx_ackseq,
+                                   ctx->tx_ring[i].payload, ctx->tx_ring[i].len);
+                    break;
+                }
+            }
         }
-        ctx->on_frame(ctx, &frame, ctx->user);
+        ctx->on_frame(ctx, &ctx->rx_frame, ctx->user);
         return;
+    }
 
     case SDP_T_STATS_REQ: {
-        /* Pack local diagnostics into a T_STATS_RSP payload (little-endian). */
-        uint8_t rsp[36];
+        /* Pack local diagnostics into a T_STATS_RSP payload (little-endian).
+         * Written directly into rx_frame.payload to avoid a second stack buffer. */
+        uint8_t *rsp = ctx->rx_frame.payload;
         const uint32_t counts[9] = {
-            ctx->diag.rx_frames,   ctx->diag.tx_frames,
-            ctx->diag.crc_errors,  ctx->diag.rx_overflows,
-            ctx->diag.drop_count,  ctx->diag.nak_sent,
-            ctx->diag.nak_received,ctx->diag.window_full,
+            ctx->diag.rx_frames,    ctx->diag.tx_frames,
+            ctx->diag.crc_errors,   ctx->diag.rx_overflows,
+            ctx->diag.drop_count,   ctx->diag.nak_sent,
+            ctx->diag.nak_received, ctx->diag.window_full,
             ctx->diag.hal_errors
         };
         uint8_t i;
         for (i = 0; i < 9; i++) {
-            rsp[i*4+0] = (uint8_t)(counts[i]       & 0xFFu);
-            rsp[i*4+1] = (uint8_t)((counts[i] >> 8)  & 0xFFu);
+            rsp[i*4+0] = (uint8_t)(counts[i]        & 0xFFu);
+            rsp[i*4+1] = (uint8_t)((counts[i] >>  8) & 0xFFu);
             rsp[i*4+2] = (uint8_t)((counts[i] >> 16) & 0xFFu);
             rsp[i*4+3] = (uint8_t)((counts[i] >> 24) & 0xFFu);
         }
@@ -221,15 +232,15 @@ static void process_frame(sdp_ctx_t *ctx)
 
     case SDP_T_STATS_RSP:
         /* Delivered to on_frame; host unpacks with sdp_diag_from_stats_rsp. */
-        ctx->on_frame(ctx, &frame, ctx->user);
+        ctx->on_frame(ctx, &ctx->rx_frame, ctx->user);
         return;
 
     case SDP_T_UNSUPPORTED:
-        ctx->on_frame(ctx, &frame, ctx->user);
+        ctx->on_frame(ctx, &ctx->rx_frame, ctx->user);
         return;
 
     default:
-        ctx->on_frame(ctx, &frame, ctx->user);
+        ctx->on_frame(ctx, &ctx->rx_frame, ctx->user);
         return;
     }
 }
@@ -416,8 +427,10 @@ sdp_status_t sdp_send(sdp_ctx_t *ctx, uint8_t type, uint8_t flags,
         return SDP_ERR_WINDOW_FULL;
     }
 
-    /* Store in TX ring for retransmission on T_NAK. */
-    slot        = &ctx->tx_ring[ctx->tx_seq % SDP_WINDOW];
+    /* Store in TX ring for retransmission on T_NAK.
+     * tx_ring_idx is a separate counter that wraps at SDP_WINDOW,
+     * eliminating the tx_seq % SDP_WINDOW division on every send. */
+    slot        = &ctx->tx_ring[ctx->tx_ring_idx];
     slot->seq   = ctx->tx_seq;
     slot->type  = type;
     slot->flags = flags;
@@ -427,6 +440,8 @@ sdp_status_t sdp_send(sdp_ctx_t *ctx, uint8_t type, uint8_t flags,
     st = transmit_frame(ctx, type, flags, ctx->tx_seq, ctx->rx_ackseq, payload, len);
     if (st != SDP_OK) return st;
 
+    ctx->tx_ring_idx = (ctx->tx_ring_idx + 1u < SDP_WINDOW)
+                       ? (uint8_t)(ctx->tx_ring_idx + 1u) : 0u;
     ctx->tx_seq      = (ctx->tx_seq >= SDP_SEQ_MAX) ? 0u : (uint8_t)(ctx->tx_seq + 1u);
     ctx->last_ack_ms = ctx->hal->millis(ctx->hal->user);
     ctx->ack_pending = 0;

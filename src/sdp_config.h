@@ -1,6 +1,8 @@
 #ifndef SDP_CONFIG_H
 #define SDP_CONFIG_H
 
+#include <stdint.h>
+
 /* Sliding window size. Default 2. Must be 1-7.                          */
 #ifndef SDP_WINDOW
 #  define SDP_WINDOW 2
@@ -27,6 +29,13 @@
 
 /* Buffer slot: header(3) + payload + crc(2), FLAG bytes stripped.      */
 #define SDP_SLOT_SIZE (SDP_MAX_PAYLOAD + 5)
+
+/* rx_pos counter type: uint8_t is sufficient when slot fits in a byte. */
+#if SDP_MAX_PAYLOAD <= 250
+   typedef uint8_t  sdp_rx_pos_t;
+#else
+   typedef uint16_t sdp_rx_pos_t;
+#endif
 
 #ifndef SDP_SILENCE_TIMEOUT_MS
 #  define SDP_SILENCE_TIMEOUT_MS 30000U

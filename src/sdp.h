@@ -124,11 +124,17 @@ struct sdp_ctx_s {
     uint8_t  sync_count;
     uint32_t holdoff_start;
 
+    /* TX ring index (increments mod SDP_WINDOW; avoids division in sdp_send) */
+    uint8_t       tx_ring_idx;
+
+    /* Assembled RX frame (kept in ctx to avoid large stack locals) */
+    sdp_frame_t   rx_frame;
+
     /* RX parser */
-    uint8_t   rx_buf[SDP_SLOT_SIZE];
-    uint16_t  rx_pos;
-    uint8_t   rx_escaped;
-    uint8_t   rx_in_frame;
+    uint8_t        rx_buf[SDP_SLOT_SIZE];
+    sdp_rx_pos_t   rx_pos;
+    uint8_t        rx_escaped;
+    uint8_t        rx_in_frame;
 
     /* Diagnostics */
     sdp_diag_t diag;
