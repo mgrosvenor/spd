@@ -10,6 +10,10 @@ add_executable(test_e2e test_e2e.c)
 target_link_libraries(test_e2e sdp)
 add_test(NAME test_e2e COMMAND test_e2e)
 
+add_executable(test_fuzz test_fuzz.c)
+target_link_libraries(test_fuzz sdp)
+add_test(NAME test_fuzz COMMAND test_fuzz)
+
 # ── Unix domain socket e2e (POSIX only) ───────────────────────────────────
 
 if(UNIX)
