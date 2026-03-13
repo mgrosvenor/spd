@@ -19,7 +19,7 @@
 
 ## 1. Overview
 
-SDP is a lightweight, framed, sequenced, and flow-controlled datagram protocol designed for low-bit-rate, unreliable physical connections between low-power, low-speed microcontrollers and a host processor. Target transports are UART, RS-485, and USB CDC — links that carry raw bytes with no built-in framing, integrity checking, or delivery guarantee.
+SDP is a lightweight, framed, sequenced, and flow-controlled datagram protocol designed for low-bit-rate, unreliable physical connections between low-power, low-speed microcontrollers. Target transports are UART, RS-485, and USB CDC — links that carry raw bytes with no built-in framing, integrity checking, or delivery guarantee.
 
 SDP can be carried over TCP or UDP for testing or simulation purposes, but it adds no value in those circumstances: TCP already provides ordering and reliable delivery, and neither transport exposes the bit-error or byte-loss failure modes that SDP is designed to handle.
 

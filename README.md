@@ -1,6 +1,6 @@
 # spd — Simple Datagram Protocol
 
-A lightweight, framed, sequenced, and flow-controlled datagram protocol designed for low-bit-rate, unreliable physical connections between low-power, low-speed microcontrollers and a host processor (UART, RS-485, USB CDC). SDP provides the framing, integrity checking, and retransmission that these links require but do not provide natively.
+A lightweight, framed, sequenced, and flow-controlled datagram protocol designed for low-bit-rate, unreliable physical connections between low-power, low-speed microcontrollers (UART, RS-485, USB CDC). SDP provides the framing, integrity checking, and retransmission that these links require but do not provide natively.
 
 ## Features
 
