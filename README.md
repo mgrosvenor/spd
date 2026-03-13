@@ -44,8 +44,7 @@ Tested to compile cleanly for:
 
 | Target | Toolchain |
 |---|---|
-| x86-64 Linux (native test host) | `gcc` / `clang` |
-| Apple Silicon (M4, AArch64) | `clang -arch arm64 -mcpu=apple-m4` |
+| Apple M4 Silicon (native test host) | `clang -arch arm64 -mcpu=apple-m4` |
 | ARM Cortex-M4 | `arm-none-eabi-gcc` |
 | AVR ATtiny1616 | `avr-gcc -mmcu=attiny1616` |
 | ESP32-U4WDH (Xtensa LX6) | `xtensa-esp32-elf-gcc` |
