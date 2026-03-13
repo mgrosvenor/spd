@@ -1,0 +1,10 @@
+set(CMAKE_SYSTEM_NAME Generic)
+set(CMAKE_SYSTEM_PROCESSOR avr)
+
+set(TOOLCHAIN_PREFIX avr-)
+find_program(CMAKE_C_COMPILER NAMES ${TOOLCHAIN_PREFIX}gcc)
+
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+
+# ATtiny1616 — target as requested
+set(CMAKE_C_FLAGS_INIT "-mmcu=attiny1616")
