@@ -56,8 +56,8 @@ Framing follows HDLC (ISO 13239). Every frame is delimited by the flag byte 0x7E
 
 ```
 ┌────────┬──────────────────┬──────────────────┬────────┬────────────────────┬─────────┬────────┐
-│  FLAG  │  SEQ[3:0]        │  TYPE[5:0]        │  LEN   │      PAYLOAD       │  CRC16  │  FLAG  │
-│  0x7E  │  ACKSEQ[3:0]     │  FLAGS[1:0]       │ 0–0xFF │  0–SDP_MAX_PAYLOAD │  2 bytes│  0x7E  │
+│  FLAG  │  SEQ[3:0]        │  TYPE[5:0]       │  LEN   │      PAYLOAD       │  CRC16  │  FLAG  │
+│  0x7E  │  ACKSEQ[3:0]     │  FLAGS[1:0]      │ 0–0xFF │  0–SDP_MAX_PAYLOAD │  2 bytes│  0x7E  │
 └────────┴──────────────────┴──────────────────┴────────┴────────────────────┴─────────┴────────┘
    1 B           1 B                 1 B           1 B           N bytes         2 bytes    1 B
 ```
