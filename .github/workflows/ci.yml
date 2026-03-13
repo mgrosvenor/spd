@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Native test suite ──────────────────────────────────────────────────────
+  # Runs the full CTest suite on each native platform.
+  native:
+    strategy:
+      matrix:
+        include:
+          - name: x86-64 Linux (gcc)
+            os: ubuntu-latest
+            cc: gcc
+          - name: x86-64 Linux (clang)
+            os: ubuntu-latest
+            cc: clang
+          - name: Apple M4 Silicon
+            os: macos-latest
+            cc: clang
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -S . -DCMAKE_C_COMPILER=${{ matrix.cc }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # ── Cross-compile (compile-only) ───────────────────────────────────────────
+  cross:
+    name: Cross-compile
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-compilers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            gcc-arm-none-eabi \
+            gcc-avr \
+            musl-tools
+
+      - name: Configure
+        run: cmake -B build -S .
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Cross-compile tests
+        run: ctest --test-dir build --output-on-failure -L cross_compile

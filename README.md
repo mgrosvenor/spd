@@ -44,6 +44,7 @@ Tested to compile cleanly for:
 
 | Target | Toolchain |
 |---|---|
+| x86-64 Linux (native test host) | `gcc` / `clang` |
 | Apple M4 Silicon (native test host) | `clang -arch arm64 -mcpu=apple-m4` |
 | ARM Cortex-M4 | `arm-none-eabi-gcc` |
 | AVR ATtiny1616 | `avr-gcc -mmcu=attiny1616` |
