@@ -6,14 +6,37 @@ A lightweight, framed, sequenced, and flow-controlled datagram protocol designed
 
 - HDLC-inspired framing with CRC-16/CCITT-FALSE integrity checking
 - 4-bit sequence numbers with piggybacked acknowledgement
-- Configurable sliding window flow control (`SDP_WINDOW`, default 2, range 1–7)
+- **Configurable sliding window flow control** — at most `SDP_WINDOW` (default 2, range 1–7) unacknowledged frames in flight; prevents buffer overrun on resource-constrained devices and enables pipelining at higher baud rates. An explicit T_ACK is sent within 50 ms if no outgoing frame is available to carry the acknowledgement piggyback.
 - Single mandatory handshake (`ANNOUNCE`) carrying a protocol version number
 - `UNSUPPORTED` response for unknown message types
 - Three-function HAL shim (`write` / `read` / `millis`) for full portability
 - Zero dynamic allocation — all state lives in a caller-supplied `sdp_ctx_t`
+- **Single-header library** — one `#include`, no separate `.c` file to compile
 - C99, no platform-specific extensions
 
 The full protocol specification is in [SPD_v1.0.md](SPD_v1.0.md).
+
+## Single-header usage
+
+SDP is distributed as a single header file (`sdp.h`) following the
+[STB-style](https://github.com/nothings/stb#how-do-i-use-these-files) pattern.
+
+In **exactly one** translation unit, define `SDP_IMPLEMENTATION` before including:
+
+```c
+#define SDP_IMPLEMENTATION
+#include "sdp.h"
+```
+
+In every other translation unit, include normally for declarations only:
+
+```c
+#include "sdp.h"
+```
+
+All compile-time configuration (`SDP_WINDOW`, `SDP_MAX_PAYLOAD`,
+`SDP_SILENCE_TIMEOUT_MS`) must be defined before the implementation include,
+or passed via the compiler (`-DSDP_WINDOW=4`).
 
 ## Platforms
 
@@ -67,15 +90,16 @@ cmake -B build -S . -DSDP_WINDOW=4
 ```cmake
 include(FetchContent)
 FetchContent_Declare(spd
-    GIT_REPOSITORY https://github.com/yourorg/spd.git
-    GIT_TAG        v1.0.0
+    GIT_REPOSITORY https://github.com/mgrosvenor/spd.git
+    GIT_TAG        v1.1.0
 )
 FetchContent_MakeAvailable(spd)
 
 target_link_libraries(myapp PRIVATE sdp::sdp)
 ```
 
-The `sdp::sdp` target exports its include path automatically — no `include_directories` needed.
+The `sdp::sdp` target is an INTERFACE library — it exports its include path
+automatically. Define `SDP_IMPLEMENTATION` in exactly one of your source files.
 
 ### find_package (after install)
 
@@ -84,7 +108,7 @@ cmake --install build --prefix /usr/local
 ```
 
 ```cmake
-find_package(sdp 1.0 REQUIRED)
+find_package(sdp 1.1 REQUIRED)
 target_link_libraries(myapp PRIVATE sdp::sdp)
 ```
 
@@ -96,6 +120,11 @@ target_link_libraries(myapp PRIVATE sdp::sdp)
 ```
 
 Tests are only built when `spd` is the top-level project, so they will not run when included as a subdirectory.
+
+### Bare-metal / no CMake
+
+Copy `src/sdp.h` into your project and add its directory to your include path.
+No other files are required.
 
 ## API summary
 
@@ -140,10 +169,11 @@ Every function returns `sdp_status_t`. Results are delivered via output paramete
 ## Quick start — embedded device (polled)
 
 ```c
+#define SDP_IMPLEMENTATION
 #include "sdp.h"
 
 static sdp_ctx_t g_sdp;
-static sdp_hal_t g_hal;
+static const sdp_hal_t g_hal = { uart_write, uart_read, sys_millis, NULL };
 
 static sdp_status_t build_announce(uint8_t *payload, uint8_t *len, void *user) {
     (void)user;
@@ -158,19 +188,11 @@ static void on_frame(sdp_ctx_t *ctx, const sdp_frame_t *f, void *user) {
         case 0x01:  /* application CMD_PING */
             sdp_send(ctx, 0x02, 0, f->payload, f->len);   /* PONG */
             break;
-        case SDP_T_NAK:
-            /* optionally retransmit with SDP_FLAG_RTX */
-            break;
         default: break;
     }
 }
 
 int main(void) {
-    g_hal.write  = uart_write;
-    g_hal.read   = uart_read;
-    g_hal.millis = sys_millis;
-    g_hal.user   = NULL;
-
     sdp_init(&g_sdp, &g_hal, on_frame, build_announce, NULL);
     sdp_listen(&g_sdp);
 
@@ -184,6 +206,9 @@ int main(void) {
 ## Quick start — host side (connect and send)
 
 ```c
+#define SDP_IMPLEMENTATION
+#include "sdp.h"
+
 sdp_frame_t announce;
 sdp_init(&ctx, &hal, on_frame, build_announce, NULL);
 
@@ -247,6 +272,42 @@ printf("rx=%u tx=%u crc_err=%u drop=%u nak_sent=%u win_full=%u\n",
        d.rx_frames, d.tx_frames, d.crc_errors,
        d.drop_count, d.nak_sent, d.window_full);
 ```
+
+## Performance reference
+
+### Frame overhead and efficiency
+
+Every SDP frame carries 7 bytes of overhead (2 FLAGS + 3 header + 2 CRC) before byte stuffing. Byte stuffing adds at most one extra byte per stuffed byte; in practice negligible for arbitrary binary data.
+
+| Payload (bytes) | Efficiency |
+|---|---|
+| 1 | 12.5% |
+| 8 | 53% |
+| 32 | 82% |
+| 128 | 95% |
+| 255 | 97% |
+
+### One-way frame latency (worst-case frame, no stuffing, 8N1)
+
+| Baud rate | 255 B payload | 128 B payload | 32 B payload |
+|---|---|---|---|
+| 9 600 | 274 ms | 141 ms | 41 ms |
+| 19 200 | 137 ms | 70 ms | 20 ms |
+| 115 200 | 22.8 ms | 11.7 ms | 3.4 ms |
+| 460 800 | 5.7 ms | 2.9 ms | 0.8 ms |
+| 1 000 000 | 2.6 ms | 1.35 ms | 0.39 ms |
+
+Round-trip latency is approximately 2× one-way. The 50 ms T_ACK timer adds up to 50 ms to the effective round-trip if no piggybacked ACK is available.
+
+### Sustained throughput (SDP_WINDOW = 2)
+
+Maximum payload throughput at 19 200 baud with 128 B payload and window = 2:
+
+```
+throughput ≈ (2 × 128 B) / (2 × 70 ms) ≈ 1.83 kB/s  (~76 % of line rate)
+```
+
+Increasing `SDP_WINDOW` proportionally increases throughput up to the line-rate ceiling.
 
 ## Thread safety
 

@@ -1,17 +1,25 @@
 include_directories(${CMAKE_SOURCE_DIR}/src)
 
 # ── Unit tests (native) ──────────────────────────────────────────────────
+#
+# Each test executable is a single translation unit.  SDP_IMPLEMENTATION is
+# defined for the whole target so that sdp.h emits the implementation in
+# that one TU.
+#
 
 add_executable(test_crc test_crc.c)
 target_link_libraries(test_crc sdp)
+target_compile_definitions(test_crc PRIVATE SDP_IMPLEMENTATION)
 add_test(NAME test_crc COMMAND test_crc)
 
 add_executable(test_e2e test_e2e.c)
 target_link_libraries(test_e2e sdp)
+target_compile_definitions(test_e2e PRIVATE SDP_IMPLEMENTATION)
 add_test(NAME test_e2e COMMAND test_e2e)
 
 add_executable(test_fuzz test_fuzz.c)
 target_link_libraries(test_fuzz sdp)
+target_compile_definitions(test_fuzz PRIVATE SDP_IMPLEMENTATION)
 add_test(NAME test_fuzz COMMAND test_fuzz)
 
 # ── Unix domain socket e2e (POSIX only) ───────────────────────────────────
@@ -19,13 +27,15 @@ add_test(NAME test_fuzz COMMAND test_fuzz)
 if(UNIX)
     add_executable(test_e2e_socket test_e2e_socket.c)
     target_link_libraries(test_e2e_socket sdp)
+    target_compile_definitions(test_e2e_socket PRIVATE SDP_IMPLEMENTATION)
     find_package(Threads REQUIRED)
     target_link_libraries(test_e2e_socket Threads::Threads)
     add_test(NAME test_e2e_socket COMMAND test_e2e_socket)
 endif()
 
 # ── Cross-compile compile-only tests ──────────────────────────────────────
-# Each test invokes the cross-compiler directly on sdp.c.
+# The script creates a temporary sdp_impl.c (#define SDP_IMPLEMENTATION +
+# #include "sdp.h") and compiles it with the target cross-compiler.
 # If the compiler is not installed the test outputs SKIP and exits 0.
 # PASS_REGULAR_EXPRESSION ensures CTest marks SKIP as pass.
 

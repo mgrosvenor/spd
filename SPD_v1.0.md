@@ -1,6 +1,6 @@
 # Serial Datagram Protocol (SDP) — Specification
 
-*Revision 1.1 — 2026-03-13*
+*Revision 1.2 — 2026-03-14*
 
 ---
 
@@ -26,7 +26,7 @@ SDP can be carried over TCP or UDP for testing or simulation purposes, but it ad
 SDP provides:
 - HDLC-inspired framing with CRC-16 integrity checking
 - 4-bit sequence numbers with piggybacked acknowledgement
-- Configurable sliding window flow control
+- **Configurable sliding window flow control** — the sender may have at most `SDP_WINDOW` (default 2, range 1–7) unacknowledged frames in flight. If the window is full, `sdp_send` returns `SDP_ERR_WINDOW_FULL` and the caller must wait. Flow control prevents buffer overrun on resource-constrained devices and allows pipelining at higher baud rates. An explicit T_ACK is sent within 50 ms if no outgoing frame is available to piggyback the acknowledgement.
 - A single mandatory handshake message (ANNOUNCE) carrying a protocol version number
 - An UNSUPPORTED response for unknown message types
 - A three-function HAL shim enabling portability across platforms
@@ -42,9 +42,18 @@ SDP does **not** define application message types, payload formats, baud rate, p
 | Frame | One complete unit of transmission: FLAG + header + payload + CRC + FLAG. |
 | Link session | The period from a successful handshake to the next SYNC_HUNT entry. |
 
-### 1.2 Shared Library Rule
+### 1.2 Single-Header Library Rule
 
-The SDP transport implementation (`sdp.c` / `sdp.h`) must have zero dependency on application state. It communicates with the rest of the system only through the HAL interface (Section 5.1) and its own `sdp_ctx_t` context struct. Any application built on SDP — including a bootloader running on the same device — links the same unmodified `sdp.c`.
+The SDP transport implementation is distributed as a single header file (`sdp.h`) following the STB-style pattern. It must have zero dependency on application state. It communicates with the rest of the system only through the HAL interface (Section 5.1) and its own `sdp_ctx_t` context struct.
+
+In exactly one translation unit, define `SDP_IMPLEMENTATION` before including to emit the implementation:
+
+```c
+#define SDP_IMPLEMENTATION
+#include "sdp.h"
+```
+
+All other translation units include `sdp.h` without the define for declarations only. Any application built on SDP — including a bootloader running on the same device — uses the same unmodified `sdp.h`.
 
 ---
 
@@ -135,20 +144,12 @@ Sequence numbers serve two purposes:
 
 ### 2.6 Flow Control
 
-Window size is controlled by the compile-time constant `SDP_WINDOW`, defaulting to 2.
+Window size is controlled by the compile-time constant `SDP_WINDOW`, defaulting to 2. Define it before the `SDP_IMPLEMENTATION` include or pass via the compiler (`-DSDP_WINDOW=4`):
 
 ```c
-/* sdp_config.h */
-#ifndef SDP_WINDOW
-#  define SDP_WINDOW 2
-#endif
-
-#if SDP_WINDOW < 1 || SDP_WINDOW > 7
-#  error "SDP_WINDOW must be in range 1–7"
-#endif
-
-#define SDP_SEQ_SIZE ((15 / SDP_WINDOW) * SDP_WINDOW)
-#define SDP_SEQ_MAX  (SDP_SEQ_SIZE - 1)
+#define SDP_WINDOW 4          /* before SDP_IMPLEMENTATION */
+#define SDP_IMPLEMENTATION
+#include "sdp.h"
 ```
 
 The constraint `SDP_WINDOW <= 7` ensures `SDP_SEQ_SIZE >= 2 * SDP_WINDOW` for all valid window values, which is required for correct duplicate detection: the receiver must be able to distinguish a new frame from a retransmit when the window is fully in flight.
@@ -347,328 +348,29 @@ All fields are 32-bit unsigned little-endian integers. The counters are cumulati
 
 ---
 
-## 5. Sample Implementation
+## 5. Implementation
 
-This section provides a portable C implementation of the SDP transport layer. It compiles without modification on any platform. The caller provides a thin HAL of three functions. All application message type definitions belong in the application layer and are not present here.
+The reference implementation is `src/sdp.h` — a single-header library using the STB pattern (see Section 1.2). The full source is the authoritative implementation reference; this section documents the HAL interface and provides platform examples.
 
 ### 5.1 HAL Interface
 
-```c
-/* sdp_hal.h — implement these three functions for your platform */
-#ifndef SDP_HAL_H
-#define SDP_HAL_H
-
-#include <stdint.h>
-
-/* Write len bytes to the transport. Blocks until all bytes are queued.   */
-void     sdp_hal_write(const uint8_t *buf, uint8_t len);
-
-/* Return next received byte, or -1 if none available (non-blocking).    */
-int      sdp_hal_read(void);
-
-/* Return milliseconds since boot (wraps at 2^32).                       */
-uint32_t sdp_hal_millis(void);
-
-#endif /* SDP_HAL_H */
-```
-
-### 5.2 Configuration Header
+The HAL is a struct of three function pointers plus a `user` context pointer forwarded to every call:
 
 ```c
-/* sdp_config.h — compile-time tuning */
-#ifndef SDP_CONFIG_H
-#define SDP_CONFIG_H
-
-/* Sliding window size. Default 2. Must be 1–7.                          */
-#ifndef SDP_WINDOW
-#  define SDP_WINDOW 2
-#endif
-
-#if SDP_WINDOW < 1 || SDP_WINDOW > 7
-#  error "SDP_WINDOW must be in range 1–7"
-#endif
-
-/* Sequence space: largest multiple of SDP_WINDOW fitting in 0x0–0xE.   */
-#define SDP_SEQ_SIZE ((15 / SDP_WINDOW) * SDP_WINDOW)
-#define SDP_SEQ_MAX  (SDP_SEQ_SIZE - 1)
-
-/* Maximum payload bytes per frame. Default 255. Must be 1–255.         */
-#ifndef SDP_MAX_PAYLOAD
-#  define SDP_MAX_PAYLOAD 255
-#endif
-
-#if SDP_MAX_PAYLOAD < 1 || SDP_MAX_PAYLOAD > 255
-#  error "SDP_MAX_PAYLOAD must be in range 1–255"
-#endif
-
-/* Buffer slot size: header(3) + payload + crc(2), FLAG bytes stripped. */
-#define SDP_SLOT_SIZE (SDP_MAX_PAYLOAD + 5)
-
-#endif /* SDP_CONFIG_H */
-```
-
-### 5.3 Protocol Core
-
-```c
-/* sdp.h */
-#ifndef SDP_H
-#define SDP_H
-
-#include <stdint.h>
-#include <stdbool.h>
-#include "sdp_config.h"
-
-/* ── Wire constants ─────────────────────────────────────────────────────── */
-#define SDP_FLAG_BYTE     0x7E
-#define SDP_ESC_BYTE      0x7D
-#define SDP_MAX_PAYLOAD   128
-#define SDP_SLOT_SIZE     132  /* header(3) + payload(128) + crc(2) - FLAGs */
-#define SDP_SEQ_NONE      0xF  /* startup sentinel in ACKSEQ nibble          */
-#define SDP_SEQ_MAX       0xE  /* highest usable SEQ value (0xF reserved)    */
-
-/* ── Transport message types (application types defined elsewhere) ───────── */
-#define SDP_T_ANNOUNCE    0x00  /* handshake ACK — protocol_version in byte 0 */
-#define SDP_T_ACK         0x30
-#define SDP_T_NAK         0x31
-#define SDP_T_RESET       0x32
-#define SDP_T_UNSUPPORTED 0x3C
-
-/* ── FLAGS bits ─────────────────────────────────────────────────────────── */
-#define SDP_FLAG_RTX      0x02  /* bit 1: this frame is a retransmit          */
-
-/* ── Frame ──────────────────────────────────────────────────────────────── */
 typedef struct {
-    uint8_t seq;
-    uint8_t ackseq;
-    uint8_t type;
-    uint8_t flags;
-    uint8_t len;
-    uint8_t payload[SDP_MAX_PAYLOAD];
-} sdp_frame_t;
-
-/* ── Context ────────────────────────────────────────────────────────────── */
-typedef struct {
-    /* TX state */
-    uint8_t  tx_seq;
-    uint8_t  rx_ackseq;
-
-    /* RX ring */
-    sdp_frame_t rx_ring[SDP_WINDOW];
-    uint8_t     rx_head;
-    uint8_t     rx_tail;
-    uint8_t     rx_count;
-
-    /* RX parser */
-    uint8_t  rx_buf[SDP_SLOT_SIZE];
-    uint8_t  rx_pos;
-    bool     rx_escaped;
-    bool     rx_in_frame;
-
-    /* Diagnostics */
-    uint32_t crc_errors;
-    uint32_t drop_count;
-    uint32_t last_ack_ms;
-} sdp_ctx_t;
-
-/* ── API ────────────────────────────────────────────────────────────────── */
-
-/* Initialise context. Call once before use or after T_RESET.             */
-void sdp_init(sdp_ctx_t *ctx);
-
-/* Feed one received byte into the parser.                                */
-/* Returns true if a complete validated frame is now in the RX ring.      */
-bool sdp_rx_byte(sdp_ctx_t *ctx, uint8_t byte);
-
-/* Pop the oldest frame from the RX ring. Returns false if ring empty.    */
-bool sdp_rx_pop(sdp_ctx_t *ctx, sdp_frame_t *out);
-
-/* Build and transmit a frame. Returns false if window is full.           */
-bool sdp_send(sdp_ctx_t *ctx, uint8_t type, uint8_t flags,
-              const uint8_t *payload, uint8_t len);
-
-/* Call periodically. Sends T_ACK if 50 ms has elapsed since last         */
-/* outgoing piggyback. Safe to call from a main loop or timer ISR.        */
-void sdp_tick(sdp_ctx_t *ctx);
-
-#endif /* SDP_H */
+    int      (*write)(const uint8_t *buf, uint8_t len, void *user);
+    int      (*read)(void *user);
+    uint32_t (*millis)(void *user);
+    void     *user;
+} sdp_hal_t;
 ```
 
-```c
-/* sdp.c */
-#include "sdp.h"
-#include "sdp_hal.h"
-#include <string.h>
+- **`write`** — write `len` bytes to the transport; return 0 on success, -1 on error
+- **`read`** — return the next received byte (0–255) or -1 if none available (non-blocking)
+- **`millis`** — return milliseconds since boot; allowed to wrap at 2³²
+- **`hal->write`** and **`hal->millis`** must not be NULL; `hal->read` may be NULL for ISR-driven RX (use `sdp_rx_byte` directly instead of `sdp_poll`)
 
-static uint16_t crc16(const uint8_t *data, uint8_t len) {
-    uint16_t crc = 0xFFFF;
-    for (uint8_t i = 0; i < len; i++) {
-        crc ^= (uint16_t)data[i] << 8;
-        for (uint8_t j = 0; j < 8; j++)
-            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
-    }
-    return crc;
-}
-
-static void write_byte(uint8_t b) {
-    if (b == SDP_FLAG_BYTE || b == SDP_ESC_BYTE) {
-        uint8_t esc[2] = { SDP_ESC_BYTE, b ^ 0x20 };
-        sdp_hal_write(esc, 2);
-    } else {
-        sdp_hal_write(&b, 1);
-    }
-}
-
-void sdp_init(sdp_ctx_t *ctx) {
-    memset(ctx, 0, sizeof(*ctx));
-    ctx->rx_ackseq   = SDP_SEQ_NONE;
-    ctx->last_ack_ms = sdp_hal_millis();
-}
-
-bool sdp_send(sdp_ctx_t *ctx, uint8_t type, uint8_t flags,
-              const uint8_t *payload, uint8_t len)
-{
-    if (len > SDP_MAX_PAYLOAD) return false;
-
-    uint8_t seq_ack  = (uint8_t)((ctx->tx_seq << 4) | (ctx->rx_ackseq & 0x0F));
-    uint8_t type_flg = (uint8_t)((type << 2) | (flags & 0x03));
-
-    /* CRC over pre-escape bytes */
-    uint8_t  hdr[3]  = { seq_ack, type_flg, len };
-    uint16_t crc     = crc16(hdr, 3);
-    for (uint8_t i = 0; i < len; i++) {
-        uint8_t b = payload[i];
-        crc ^= (uint16_t)b << 8;
-        for (uint8_t j = 0; j < 8; j++)
-            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
-    }
-
-    uint8_t flag = SDP_FLAG_BYTE;
-    sdp_hal_write(&flag, 1);
-    write_byte(seq_ack);
-    write_byte(type_flg);
-    write_byte(len);
-    for (uint8_t i = 0; i < len; i++) write_byte(payload[i]);
-    write_byte((uint8_t)(crc >> 8));
-    write_byte((uint8_t)(crc & 0xFF));
-    sdp_hal_write(&flag, 1);
-
-    ctx->tx_seq = (ctx->tx_seq >= SDP_SEQ_MAX) ? 0 : ctx->tx_seq + 1;
-    ctx->last_ack_ms = sdp_hal_millis();
-    return true;
-}
-
-bool sdp_rx_byte(sdp_ctx_t *ctx, uint8_t byte) {
-    if (byte == SDP_FLAG_BYTE) {
-        if (ctx->rx_in_frame && ctx->rx_pos >= 5) {
-            /* header(3) + crc(2) = 5 minimum */
-            uint8_t  len      = ctx->rx_buf[2];
-            uint16_t expected = ((uint16_t)ctx->rx_buf[ctx->rx_pos - 2] << 8)
-                               | ctx->rx_buf[ctx->rx_pos - 1];
-            uint16_t actual   = crc16(ctx->rx_buf, ctx->rx_pos - 2);
-
-            if (len <= SDP_MAX_PAYLOAD
-                && (ctx->rx_pos == (uint8_t)(len + 5))
-                && actual == expected
-                && ctx->rx_count < SDP_WINDOW)
-            {
-                sdp_frame_t *slot = &ctx->rx_ring[ctx->rx_tail];
-                slot->seq    = ctx->rx_buf[0] >> 4;
-                slot->ackseq = ctx->rx_buf[0] & 0x0F;
-                slot->type   = ctx->rx_buf[1] >> 2;
-                slot->flags  = ctx->rx_buf[1] & 0x03;
-                slot->len    = len;
-                memcpy(slot->payload, ctx->rx_buf + 3, len);
-                ctx->rx_tail   = (ctx->rx_tail + 1) % SDP_WINDOW;
-                ctx->rx_count++;
-                ctx->rx_ackseq = slot->seq;
-                ctx->last_ack_ms = sdp_hal_millis();
-            } else {
-                ctx->crc_errors++;
-            }
-        }
-        ctx->rx_in_frame = true;
-        ctx->rx_pos      = 0;
-        ctx->rx_escaped  = false;
-        return ctx->rx_count > 0;
-    }
-
-    if (!ctx->rx_in_frame) return false;
-
-    if (byte == SDP_ESC_BYTE) { ctx->rx_escaped = true; return false; }
-    if (ctx->rx_escaped)      { byte ^= 0x20; ctx->rx_escaped = false; }
-
-    if (ctx->rx_pos < SDP_SLOT_SIZE)
-        ctx->rx_buf[ctx->rx_pos++] = byte;
-    else {
-        ctx->rx_in_frame = false;
-        ctx->rx_pos      = 0;
-    }
-    return false;
-}
-
-bool sdp_rx_pop(sdp_ctx_t *ctx, sdp_frame_t *out) {
-    if (ctx->rx_count == 0) return false;
-    *out = ctx->rx_ring[ctx->rx_head];
-    ctx->rx_head  = (ctx->rx_head + 1) % SDP_WINDOW;
-    ctx->rx_count--;
-    return true;
-}
-
-void sdp_tick(sdp_ctx_t *ctx) {
-    if ((sdp_hal_millis() - ctx->last_ack_ms) >= 50)
-        sdp_send(ctx, SDP_T_ACK, 0, NULL, 0);
-}
-```
-
-### 5.4 Startup Handshake Helper
-
-```c
-/* sdp_handshake.c — host-side handshake helper */
-#include "sdp.h"
-#include "sdp_hal.h"
-#include <string.h>
-
-#define SDP_SYNC_BYTE     0xAA
-#define SDP_SYNC_COUNT    17
-#define SDP_SYNC_TIMEOUT  10000   /* ms — total handshake budget          */
-#define SDP_SYNC_RETRY_MS 20      /* ms — top-up interval                 */
-
-/*
- * Run the host side of the SDP startup handshake.
- *
- * On success: ANNOUNCE frame is placed in out_announce, returns true.
- * The caller must verify out_announce->payload[0] (protocol_version).
- *
- * On timeout: returns false.
- */
-bool sdp_handshake(sdp_ctx_t *ctx, sdp_frame_t *out_announce) {
-    uint8_t sync[SDP_SYNC_COUNT];
-    memset(sync, SDP_SYNC_BYTE, SDP_SYNC_COUNT);
-    sdp_hal_write(sync, SDP_SYNC_COUNT);
-
-    uint32_t start    = sdp_hal_millis();
-    uint32_t last_top = sdp_hal_millis();
-
-    while ((sdp_hal_millis() - start) < SDP_SYNC_TIMEOUT) {
-        int b = sdp_hal_read();
-        if (b >= 0 && sdp_rx_byte(ctx, (uint8_t)b)) {
-            sdp_frame_t f;
-            if (sdp_rx_pop(ctx, &f) && f.type == SDP_T_ANNOUNCE) {
-                if (out_announce) *out_announce = f;
-                return true;
-            }
-        }
-        if ((sdp_hal_millis() - last_top) >= SDP_SYNC_RETRY_MS) {
-            uint8_t top = SDP_SYNC_BYTE;
-            sdp_hal_write(&top, 1);
-            last_top = sdp_hal_millis();
-        }
-    }
-    return false;
-}
-```
-
-### 5.5 Platform HAL Examples
+### 5.2 Platform HAL Examples
 
 **x86 / libserialport:**
 ```c
@@ -676,51 +378,62 @@ bool sdp_handshake(sdp_ctx_t *ctx, sdp_frame_t *out_announce) {
 #include <time.h>
 static struct sp_port *_port;
 
-void sdp_hal_write(const uint8_t *buf, uint8_t len) {
-    sp_blocking_write(_port, buf, len, 100);
+static int hal_write(const uint8_t *buf, uint8_t len, void *user) {
+    (void)user;
+    return sp_blocking_write(_port, buf, len, 100) == len ? 0 : -1;
 }
-int sdp_hal_read(void) {
+static int hal_read(void *user) {
+    (void)user;
     uint8_t b;
     return sp_nonblocking_read(_port, &b, 1) == 1 ? b : -1;
 }
-uint32_t sdp_hal_millis(void) {
+static uint32_t hal_millis(void *user) {
+    (void)user;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
+static const sdp_hal_t hal = { hal_write, hal_read, hal_millis, NULL };
 ```
 
-**AVR (ATtiny/ATmega, polled UART):**
+**AVR ATtiny1616 (polled UART, PIT millis):**
 ```c
 #include <avr/io.h>
-void sdp_hal_write(const uint8_t *buf, uint8_t len) {
+static volatile uint32_t g_millis;
+ISR(RTC_PIT_vect) { RTC.PITINTFLAGS = RTC_PI_bm; g_millis++; }
+
+static int hal_write(const uint8_t *buf, uint8_t len, void *user) {
+    (void)user;
     for (uint8_t i = 0; i < len; i++) {
         while (!(USART0.STATUS & USART_DREIF_bm));
         USART0.TXDATAL = buf[i];
     }
+    return 0;
 }
-int sdp_hal_read(void) {
+static int hal_read(void *user) {
+    (void)user;
     if (!(USART0.STATUS & USART_RXCIF_bm)) return -1;
     return USART0.RXDATAL;
 }
-uint32_t sdp_hal_millis(void) {
-    extern volatile uint32_t g_millis_tick;  /* incremented by PIT ISR    */
-    return g_millis_tick;
-}
+static uint32_t hal_millis(void *user) { (void)user; return g_millis; }
+static const sdp_hal_t hal = { hal_write, hal_read, hal_millis, NULL };
 ```
 
 **ARM Cortex-M (CMSIS, polled):**
 ```c
 #include "stm32xx_hal.h"
 extern UART_HandleTypeDef huart1;
-void sdp_hal_write(const uint8_t *buf, uint8_t len) {
-    HAL_UART_Transmit(&huart1, (uint8_t *)buf, len, HAL_MAX_DELAY);
+static int hal_write(const uint8_t *buf, uint8_t len, void *user) {
+    (void)user;
+    return HAL_UART_Transmit(&huart1, (uint8_t *)buf, len, HAL_MAX_DELAY) == HAL_OK ? 0 : -1;
 }
-int sdp_hal_read(void) {
+static int hal_read(void *user) {
+    (void)user;
     uint8_t b;
     return HAL_UART_Receive(&huart1, &b, 1, 0) == HAL_OK ? b : -1;
 }
-uint32_t sdp_hal_millis(void) { return HAL_GetTick(); }
+static uint32_t hal_millis(void *user) { (void)user; return HAL_GetTick(); }
+static const sdp_hal_t hal = { hal_write, hal_read, hal_millis, NULL };
 ```
 
 ---
@@ -752,6 +465,7 @@ One-way frame latency = time to transmit the frame at the line rate. The table b
 | Baud rate | 255 B payload (262 B frame) | 128 B payload (135 B frame) | 32 B payload (39 B frame) |
 |---|---|---|---|
 | 9 600 | 274 ms | 141 ms | 41 ms |
+| 19 200 | 137 ms | 70 ms | 20 ms |
 | 115 200 | 22.8 ms | 11.7 ms | 3.4 ms |
 | 460 800 | 5.7 ms | 2.9 ms | 0.8 ms |
 | 1 000 000 | 2.6 ms | 1.35 ms | 0.39 ms |
@@ -888,5 +602,6 @@ Attempt to compile with SDP_WINDOW=8. Confirm a compile-time error is emitted. C
 
 | Revision | Date | Changes |
 |---|---|---|
+| 1.2 | 2026-03-14 | Converted to single-header library (STB pattern). `sdp.c` and `sdp_config.h` merged into `sdp.h` behind `#ifdef SDP_IMPLEMENTATION`. Section 1.2 updated (Shared Library Rule). Section 2.6 configuration snippet updated. Section 5 replaced with single-header usage, HAL interface description, and updated platform examples matching `sdp_hal_t` function-pointer struct. 19 200 baud row added to performance table. |
 | 1.1 | 2026-03-13 | TX retransmit buffer: sender stores each transmitted frame in `tx_ring[seq % SDP_WINDOW]`; T_NAK triggers retransmit from ring with RTX flag (Section 2.9). SDP_SEQ_SIZE/SDP_SEQ_MAX derived from SDP_WINDOW as `(15/SDP_WINDOW)*SDP_WINDOW`, guaranteed ≥ 2× window (Section 2.5). SDP_MAX_PAYLOAD promoted to compile-time parameter (default 255, range 3–255); SDP_SLOT_SIZE derived as SDP_MAX_PAYLOAD+5. ANNOUNCE bytes 1–2 now mandatory transport fields (window, max_payload). T_STATS_REQ (0x33) / T_STATS_RSP (0x34) added for host-side link diagnostics (Section 4.7–4.8). Performance reference section added (Section 6). |
 | 1.0 | 2026-03-13 | Initial release as standalone library specification. Transport layer, startup handshake, ANNOUNCE (protocol_version mandatory; remaining bytes application-defined), UNSUPPORTED (0x3C), T_ACK/T_NAK/T_RESET. Maximum payload 128 bytes (LEN 0x00–0x80). SDP_WINDOW compile-time constant defaulting to 2, static assert 1–7. Platform HAL examples: x86/libserialport, AVR, ARM Cortex-M. |

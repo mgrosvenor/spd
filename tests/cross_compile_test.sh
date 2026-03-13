@@ -22,12 +22,16 @@ fi
 TMPDIR_OUT=$(mktemp -d)
 trap 'rm -rf "${TMPDIR_OUT}"' EXIT
 
+# Generate a minimal translation unit that instantiates the implementation.
+IMPL_FILE="${TMPDIR_OUT}/sdp_impl.c"
+printf '#define SDP_IMPLEMENTATION\n#include "sdp.h"\n' > "${IMPL_FILE}"
+
 # First attempt: standard headers
 # shellcheck disable=SC2086
 if ${COMPILER} ${CFLAGS} -std=c99 -Wall -Wextra -Wpedantic \
     -I"${SRC_DIR}" \
-    -c "${SRC_DIR}/sdp.c" \
-    -o "${TMPDIR_OUT}/sdp.o" \
+    -c "${IMPL_FILE}" \
+    -o "${TMPDIR_OUT}/sdp_impl.o" \
     > "${TMPDIR_OUT}/build.log" 2>&1; then
     echo "PASS: ${TARGET_NAME}"
     exit 0
@@ -40,8 +44,8 @@ if ${COMPILER} ${CFLAGS} -std=c99 -Wall -Wextra -Wpedantic \
     -I"${CROSS_HEADERS}" \
     -I"$(${COMPILER} -print-file-name=include 2>/dev/null)" \
     -I"${SRC_DIR}" \
-    -c "${SRC_DIR}/sdp.c" \
-    -o "${TMPDIR_OUT}/sdp.o" \
+    -c "${IMPL_FILE}" \
+    -o "${TMPDIR_OUT}/sdp_impl.o" \
     > "${TMPDIR_OUT}/build2.log" 2>&1; then
     echo "PASS: ${TARGET_NAME} (with cross-header shim)"
     exit 0
