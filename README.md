@@ -289,13 +289,14 @@ Every SDP frame carries 7 bytes of overhead (2 FLAGS + 3 header + 2 CRC) before 
 
 ### One-way frame latency (worst-case frame, no stuffing, 8N1)
 
-| Baud rate | 255 B payload | 128 B payload | 32 B payload |
-|---|---|---|---|
-| 9 600 | 274 ms | 141 ms | 41 ms |
-| 19 200 | 137 ms | 70 ms | 20 ms |
-| 115 200 | 22.8 ms | 11.7 ms | 3.4 ms |
-| 460 800 | 5.7 ms | 2.9 ms | 0.8 ms |
-| 1 000 000 | 2.6 ms | 1.35 ms | 0.39 ms |
+| Baud rate | 255 B payload | 128 B payload | 32 B payload | 16 B payload | 8 B payload |
+|---|---|---|---|---|---|
+| 9 600 | 274 ms | 141 ms | 41 ms | 24.0 ms | 15.6 ms |
+| 19 200 | 137 ms | 70 ms | 20 ms | 12.0 ms | 7.8 ms |
+| 115 200 | 22.8 ms | 11.7 ms | 3.4 ms | 2.0 ms | 1.3 ms |
+| 230 400 | 11.4 ms | 5.9 ms | 1.7 ms | 1.0 ms | 0.65 ms |
+| 460 800 | 5.7 ms | 2.9 ms | 0.8 ms | 0.50 ms | 0.33 ms |
+| 1 000 000 | 2.6 ms | 1.35 ms | 0.39 ms | 0.23 ms | 0.15 ms |
 
 Round-trip latency is approximately 2× one-way. The 50 ms T_ACK timer adds up to 50 ms to the effective round-trip if no piggybacked ACK is available.
 

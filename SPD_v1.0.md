@@ -462,14 +462,15 @@ Byte stuffing adds at most one extra byte per stuffed byte. In the worst case (a
 
 One-way frame latency = time to transmit the frame at the line rate. The table below uses the maximum (worst-case) frame size at each `SDP_MAX_PAYLOAD` setting, assuming no byte stuffing, one start bit, eight data bits, one stop bit (10 bits/byte).
 
-| Baud rate | 255 B payload (262 B frame) | 128 B payload (135 B frame) | 32 B payload (39 B frame) |
-|---|---|---|---|
-| 9 600 | 274 ms | 141 ms | 41 ms |
-| 19 200 | 137 ms | 70 ms | 20 ms |
-| 115 200 | 22.8 ms | 11.7 ms | 3.4 ms |
-| 460 800 | 5.7 ms | 2.9 ms | 0.8 ms |
-| 1 000 000 | 2.6 ms | 1.35 ms | 0.39 ms |
-| 3 000 000 | 0.87 ms | 0.45 ms | 0.13 ms |
+| Baud rate | 255 B payload (262 B frame) | 128 B payload (135 B frame) | 32 B payload (39 B frame) | 16 B payload (23 B frame) | 8 B payload (15 B frame) |
+|---|---|---|---|---|---|
+| 9 600 | 274 ms | 141 ms | 41 ms | 24.0 ms | 15.6 ms |
+| 19 200 | 137 ms | 70 ms | 20 ms | 12.0 ms | 7.8 ms |
+| 115 200 | 22.8 ms | 11.7 ms | 3.4 ms | 2.0 ms | 1.3 ms |
+| 230 400 | 11.4 ms | 5.9 ms | 1.7 ms | 1.0 ms | 0.65 ms |
+| 460 800 | 5.7 ms | 2.9 ms | 0.8 ms | 0.50 ms | 0.33 ms |
+| 1 000 000 | 2.6 ms | 1.35 ms | 0.39 ms | 0.23 ms | 0.15 ms |
+| 3 000 000 | 0.87 ms | 0.45 ms | 0.13 ms | 0.077 ms | 0.050 ms |
 
 Round-trip latency (command + response, minimum two frames in flight) is approximately 2× the one-way values. The 50 ms T_ACK timer (Section 2.7) adds up to 50 ms to the effective round trip if no piggybacked ACK is available, so applications should aim to reply within the ACK window.
 
